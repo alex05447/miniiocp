@@ -1,0 +1,17 @@
+[package]
+name = "miniiocp"
+version = "0.1.0"
+authors = ["N/A <N/A>"]
+edition = "2018"
+
+[lib]
+name = "miniiocp"
+
+[dependencies]
+winapi = { version = "0.3", features = [    "std"
+                                            ,"winbase"
+                                            ,"ioapiset"
+                                            ,"handleapi"
+                                            ,"errhandlingapi"
+                                            ,"fileapi"
+                                            ,"winerror" ] }
