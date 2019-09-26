@@ -8,4 +8,4 @@
 
 mod iocp;
 
-pub use crate::iocp::{ IOResult, IOCPResult, IOCP };
+pub use crate::iocp::{IOCPResult, IOResult, IOCP};
