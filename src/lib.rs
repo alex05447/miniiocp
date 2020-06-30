@@ -4,8 +4,10 @@
 //!
 //! Run `cargo --doc` for documentation.
 //!
-//! Uses [`winapi`](https://docs.rs/winapi/0.3.8/winapi/).
+//! See the tests for some example code.
+//!
+//! Uses [`winapi`](https://docs.rs/winapi/*/winapi/).
 
 mod iocp;
 
-pub use crate::iocp::{IOCPResult, IOResult, IOCP};
+pub use crate::iocp::{IOCPError, IOCPResult, IOResult, IOCP};

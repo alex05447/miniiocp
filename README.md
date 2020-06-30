@@ -6,4 +6,6 @@ See [`I/O Completion Ports`](https://docs.microsoft.com/en-us/windows/win32/file
 
 Run `cargo --doc` for documentation.
 
-Uses [`winapi`](https://docs.rs/winapi/0.3.8/winapi/).
+See the tests for some example code.
+
+Uses [`winapi`](https://docs.rs/winapi/*/winapi/).

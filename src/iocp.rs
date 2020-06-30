@@ -1,58 +1,117 @@
-use std::ptr;
-use std::time::Duration;
-
-use winapi::um::errhandlingapi::GetLastError;
-use winapi::um::handleapi::{CloseHandle, INVALID_HANDLE_VALUE};
-use winapi::um::ioapiset::{
-    CreateIoCompletionPort, GetQueuedCompletionStatus, PostQueuedCompletionStatus,
+use {
+    std::{
+        error::Error,
+        ffi::c_void,
+        fmt::{Display, Formatter},
+        ptr::{self, NonNull},
+        time::Duration,
+    },
+    winapi::um::{
+        handleapi::{CloseHandle, INVALID_HANDLE_VALUE},
+        ioapiset::{CreateIoCompletionPort, GetQueuedCompletionStatus, PostQueuedCompletionStatus},
+        minwinbase::{LPOVERLAPPED, OVERLAPPED},
+        winbase::INFINITE,
+        winnt::HANDLE,
+    },
 };
-use winapi::um::minwinbase::{LPOVERLAPPED, OVERLAPPED};
-use winapi::um::winbase::INFINITE;
-use winapi::um::winnt::HANDLE;
 
-/// Describes the completed async IO operation.
+/// Describes the completed IO operation.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct IOResult {
     /// How many bytes were read/written.
     pub bytes_transferred: usize,
-
     /// Same value as the one provided by the caller in [`associate_handle_key`],
     /// or `0` if none was provided (by [`associate_handle`]).
     /// May be used to map back to the IO handle on which the operation was performed.
     ///
+    /// NOTE: `key` value `0xffff_ffff_ffff_ffff`, a.k.a. `usize::MAX`, is reserved and will never appear here.
+    ///
     /// [`associate_handle_key`]: struct.IOCP.html#method.associate_handle_key
     /// [`associate_handle`]: struct.IOCP.html#method.associate_handle
     pub key: usize,
-
     /// Pointer to the `OVERLAPPED` struct used for the IO operation.
-    pub overlapped: *const OVERLAPPED,
+    ///
+    /// NOTE - this is never null, because
+    /// 1) if the file was opened for asynchronous (a.k.a. overlapped) IO, a non-null `OVERLAPPED` pointer is required in `ReadFile` / `WriteFile` calls
+    /// and hence will be returned when dequeueing an IO completion event off the IO completion port
+    /// (even if the operation completed synchronously and the file handle was not explicitly opted out from redundant notifications
+    /// (see [`SetFileCompletionNotificationModes`](https://docs.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-setfilecompletionnotificationmodes) with `FILE_SKIP_COMPLETION_PORT_ON_SUCCESS`)),
+    /// 2) if the file was opened for synchronous IO, it could not have been associated with the IO completion port in the first place.
+    pub overlapped: NonNull<OVERLAPPED>,
 }
 
 unsafe impl Send for IOResult {}
 unsafe impl Sync for IOResult {}
 
 /// Result of waiting on an IO completion port with a timeout.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum IOCPResult {
     /// An IO operation on an associated IO handle was completed.
+    ///
+    /// NOTE - unless the (asynchronous) file handle was explicitly opted out
+    /// (see [`SetFileCompletionNotificationModes`](https://docs.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-setfilecompletionnotificationmodes) with `FILE_SKIP_COMPLETION_PORT_ON_SUCCESS`),
+    /// this might be a duplicate completion event for an IO operation that has
+    /// already completed synchronously.
     IOComplete(IOResult),
-
     /// The port was signaled (via the call to [`IOCP::set`](struct.IOCP.html#method.set)).
     Signaled,
-
-    /// The timeout duration elapsed before an IO operation was completed / the port was signaled.
+    /// The timeout duration in the call to [`IOCP::wait`](struct.IOCP.html#method.wait) elapsed
+    /// before an IO operation was completed / the port was signaled.
     Timeout,
 }
 
+#[derive(Debug)]
+pub enum IOCPError {
+    /// Failed to create the IO completion port.
+    FailedToCreate,
+    /// Key value `usize::MAX` is reserved.
+    InvalidKey,
+    /// Tried to associate an invalid handle with the IO completion port.
+    InvalidIOHandle,
+    /// Failed to associate the IO handle with the IO completion port
+    /// (e.g., the handle was not opened for overlapped IO).
+    /// Contains the OS error.
+    FailedToAssociate(std::io::Error),
+    /// Failed to wait on the IO completion port.
+    /// Contains the OS error.
+    FailedToWait(std::io::Error),
+}
+
+impl Error for IOCPError {}
+
+impl Display for IOCPError {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
+        use IOCPError::*;
+
+        match self {
+            FailedToCreate => "failed to create the IO completion port".fmt(f),
+            InvalidKey => "key value `usize::MAX` is reserved".fmt(f),
+            InvalidIOHandle => {
+                "tried to associate an invalid handle with the IO completion port".fmt(f)
+            }
+            FailedToAssociate(err) => write!(
+                f,
+                "failed to associate the IO handle with the IO completion port: {}",
+                err
+            ),
+            FailedToWait(err) => write!(f, "failed to wait on the IO completion port: {}", err),
+        }
+    }
+}
+
 /// The object that represents a Windows IO completion port.
+///
 /// Closes the owned OS handle when dropped.
-/// See [`I/O Completion Ports`](https://docs.microsoft.com/en-us/windows/win32/fileio/i-o-completion-ports).
+///
+/// See [`the I/O Completion Ports documentation`](https://docs.microsoft.com/en-us/windows/win32/fileio/i-o-completion-ports) for more information.
 pub struct IOCP {
-    handle: HANDLE,
+    handle: NonNull<c_void>,
 }
 
 unsafe impl Send for IOCP {}
 unsafe impl Sync for IOCP {}
 
-const IOCP_SIGNALED_KEY: usize = 0xffff_ffff;
+const IOCP_SIGNALED_KEY: usize = usize::MAX;
 
 impl IOCP {
     /// Creates a new IO completion port on which up to `num_threads` may block
@@ -60,65 +119,62 @@ impl IOCP {
     /// `1` is a good default value.
     /// `0` means the OS will allow as many threads as system cores to block.
     ///
-    /// # Panics
-    ///
-    /// Panics if the OS object creation fails.
-    pub fn new(num_threads: usize) -> Self {
-        let handle = unsafe {
-            CreateIoCompletionPort(INVALID_HANDLE_VALUE, 0 as HANDLE, 0, num_threads as _)
-        };
+    /// May return an error if the OS IO completion object creation failed for some reason.
+    pub fn new(num_threads: usize) -> Result<Self, IOCPError> {
+        let handle =
+            unsafe { CreateIoCompletionPort(INVALID_HANDLE_VALUE, 0 as _, 0, num_threads as _) };
 
-        if handle.is_null() {
-            panic!("IO completion port creation failed.");
-        }
+        let handle = NonNull::new(handle).ok_or(IOCPError::FailedToCreate)?;
 
-        Self { handle }
+        Ok(Self { handle })
     }
 
-    /// Associates the `io_handle` (open for async a.k.a "overlapped" IO) with the IO completion port.
-    /// The IOCP will be notified when the async IO operation completes, waking one thread
+    /// Associates the `io_handle` (opened for async a.k.a "overlapped" IO) with the IO completion port.
+    ///
+    /// The IOCP will be notified when an async IO operation completes for this `io_handle`, waking one thread
     /// from the call to [`wait`] / [`wait_infinite`] with [`IOCPResult::IOComplete`].
+    ///
+    /// Returns an error if the `io_handle` is invalid or was not opened for overlapped IO.
     ///
     /// # Remarks
     ///
     /// Unless the IO handle has explicitly opted out
     /// (see [`SetFileCompletionNotificationModes`](https://docs.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-setfilecompletionnotificationmodes)
     /// with `FILE_SKIP_COMPLETION_PORT_ON_SUCCESS`),
-    /// the IOCP will also be notified if the IO operation has completed synchronously,
+    /// the IOCP will also be notified if the IO operation has completed synchronously for this `io_handle`,
     /// which might cause the completion to be handled twice and lead to bugs.
     ///
     /// [`wait`]: #method.wait
     /// [`wait_infinite`]: #method.wait_infinite
     /// [`IOCPResult::IOComplete`]: enum.IOCPResult.html#variant.IOComplete
-    pub fn associate_handle(&self, io_handle: HANDLE) {
+    pub fn associate_handle(&self, io_handle: HANDLE) -> Result<(), IOCPError> {
         self.associate_handle_impl(io_handle, 0)
     }
 
     /// Associates the `io_handle` (open for async a.k.a "overlapped" IO) with the IO completion port.
-    /// The IOCP will be notified when the async IO operation completes, waking one thread
+    ///
+    /// The IOCP will be notified when an async IO operation completes for this `io_handle`, waking one thread
     /// from the call to [`wait`] / [`wait_infinite`] with [`IOCPResult::IOComplete`].
     ///
     /// Provided user-defined `key` will be returned in [`IOResult`](struct.IOResult.html#field.key)
     /// on IO completion.
     ///
-    /// `key` value `0xffff_ffff` is reserved.
+    /// NOTE: `key` value `0xffff_ffff_ffff_ffff`, a.k.a. `usize::MAX`, is reserved.
+    ///
+    /// Returns an error if the `io_handle` is invalid, was not opened for overlapped IO, or if `key` is `usize::MAX`.
     ///
     /// # Remarks
     ///
     /// Unless the IO handle has explicitly opted out
     /// (see [`SetFileCompletionNotificationModes`](https://docs.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-setfilecompletionnotificationmodes)
     /// with `FILE_SKIP_COMPLETION_PORT_ON_SUCCESS`),
-    /// the IOCP will also be notified if the IO operation has completed synchronously,
+    /// the IOCP will also be notified if the IO operation has completed synchronously for this `io_handle`,
     /// which might cause the completion to be handled twice and lead to bugs.
-    ///
-    /// # Pancis
-    ///
-    /// Panics if the invalid `key` value (`0xffff_ffff`) was provided.
     ///
     /// [`wait`]: #method.wait
     /// [`wait_infinite`]: #method.wait_infinite
     /// [`IOCPResult::IOComplete`]: enum.IOCPResult.html#variant.IOComplete
-    pub fn associate_handle_key(&self, io_handle: HANDLE, key: usize) {
+    pub fn associate_handle_key(&self, io_handle: HANDLE, key: usize) -> Result<(), IOCPError> {
         self.associate_handle_impl(io_handle, key)
     }
 
@@ -129,7 +185,12 @@ impl IOCP {
     /// [`IOCPResult::Signaled`]: enum.IOCPResult.html#variant.Signaled
     pub fn set(&self) {
         let result = unsafe {
-            PostQueuedCompletionStatus(self.handle, 0, IOCP_SIGNALED_KEY, ptr::null_mut() as _)
+            PostQueuedCompletionStatus(
+                self.handle.as_ptr(),
+                0,
+                IOCP_SIGNALED_KEY,
+                ptr::null_mut() as _,
+            )
         };
 
         debug_assert!(result != 0);
@@ -147,12 +208,12 @@ impl IOCP {
     /// [`associate_handle_key`]: #method.associate_handle_key
     /// [`set`]: #method.set
     /// [`IOCPResult`]: enum.IOCPResult.html
-    pub fn wait(&self, d: Duration) -> IOCPResult {
+    pub fn wait(&self, d: Duration) -> Result<IOCPResult, IOCPError> {
         let ms = d.as_millis();
         debug_assert!(ms <= std::u32::MAX as u128);
         let ms = ms as u32;
 
-        self.wait_internal(ms)
+        self.wait_impl(ms)
     }
 
     /// Blocks the current thread until
@@ -160,33 +221,36 @@ impl IOCP {
     /// (via the call to [`associate_handle`] / [`associate_handle_key`]),
     /// 2) the IO completion port is signaled
     /// (via the call to [`set`]),
-    /// Returns the corresponding variant of [`IOCPResult`] (except `IOCPResult::Timeout`).
+    /// Returns the corresponding variant of [`IOCPResult`] (except [`Timeout`]).
     ///
     /// [`associate_handle`]: #method.associate_handle
     /// [`associate_handle_key`]: #method.associate_handle_key
     /// [`set`]: #method.set
     /// [`IOCPResult`]: enum.IOCPResult.html
-    pub fn wait_infinite(&self) -> IOCPResult {
-        self.wait_internal(INFINITE)
+    /// [`Timeout`]: enum.IOCPResult.html#variant.Timeout
+    pub fn wait_infinite(&self) -> Result<IOCPResult, IOCPError> {
+        self.wait_impl(INFINITE)
     }
 
-    fn associate_handle_impl(&self, io_handle: HANDLE, key: usize) {
-        debug_assert!(io_handle != INVALID_HANDLE_VALUE);
-        debug_assert!(io_handle != 0 as HANDLE);
+    fn associate_handle_impl(&self, io_handle: HANDLE, key: usize) -> Result<(), IOCPError> {
+        if (io_handle == INVALID_HANDLE_VALUE) || (io_handle == 0 as _) {
+            return Err(IOCPError::InvalidIOHandle);
+        }
 
-        assert!(
-            key != IOCP_SIGNALED_KEY,
-            "Key value `0xffff_ffff` is reserved for internal use."
-        );
+        if key == IOCP_SIGNALED_KEY {
+            return Err(IOCPError::InvalidKey);
+        }
 
-        let handle = unsafe { CreateIoCompletionPort(io_handle, self.handle, key, 1) };
+        let handle = unsafe { CreateIoCompletionPort(io_handle, self.handle.as_ptr(), key, 0) };
 
-        if handle != self.handle {
-            panic!("Failed to associate the handle with the IOCompletionPort.");
+        if handle == self.handle.as_ptr() {
+            Ok(())
+        } else {
+            Err(IOCPError::FailedToAssociate(std::io::Error::last_os_error()))
         }
     }
 
-    fn wait_internal(&self, ms: u32) -> IOCPResult {
+    fn wait_impl(&self, ms: u32) -> Result<IOCPResult, IOCPError> {
         let mut key: usize = 0;
 
         let mut bytes_transferred: u32 = 0;
@@ -194,7 +258,7 @@ impl IOCP {
 
         let result = unsafe {
             GetQueuedCompletionStatus(
-                self.handle,
+                self.handle.as_ptr(),
                 &mut bytes_transferred as *mut _,
                 &mut key as *mut _,
                 &mut overlapped as *mut _,
@@ -209,34 +273,29 @@ impl IOCP {
                 debug_assert!(overlapped.is_null());
                 debug_assert!(bytes_transferred == 0);
 
-                return IOCPResult::Signaled;
+                return Ok(IOCPResult::Signaled);
             }
             // Dequeued an IO completion event.
             else {
                 debug_assert!(!overlapped.is_null());
 
-                return IOCPResult::IOComplete(IOResult {
+                return Ok(IOCPResult::IOComplete(IOResult {
                     bytes_transferred: bytes_transferred as usize,
                     key,
-                    overlapped,
-                });
+                    overlapped: unsafe { NonNull::new_unchecked(overlapped) },
+                }));
             }
 
         // Failure.
         } else {
             // Timeout.
             if (ms != INFINITE) && overlapped.is_null() {
-                return IOCPResult::Timeout;
+                return Ok(IOCPResult::Timeout);
             }
 
             // Unknown error otherwise.
             // NOTE: includes successful dequeueing of failed IO. Might want to handle this properly in the future.
-            let error = unsafe { GetLastError() };
-
-            panic!(
-                "Unknown error (code `{}`) when waiting on IOCompletionPort.",
-                error
-            );
+            Err(IOCPError::FailedToWait(std::io::Error::last_os_error()))
         }
     }
 }
@@ -244,16 +303,17 @@ impl IOCP {
 impl Drop for IOCP {
     fn drop(&mut self) {
         unsafe {
-            CloseHandle(self.handle);
+            CloseHandle(self.handle.as_ptr());
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #![allow(non_snake_case)]
+
     use std::{
         cmp, fs, io, mem,
-        mem::discriminant,
         os::windows::{fs::OpenOptionsExt, io::AsRawHandle},
         path::Path,
         sync::{
@@ -264,28 +324,37 @@ mod tests {
         time::Instant,
     };
 
-    use winapi::shared::minwindef::DWORD;
-    use winapi::shared::winerror::ERROR_IO_PENDING;
-    use winapi::um::errhandlingapi::GetLastError;
-    use winapi::um::fileapi::WriteFile;
-    use winapi::um::ioapiset::GetOverlappedResult;
-    use winapi::um::minwinbase::OVERLAPPED;
-    use winapi::um::winbase::{
-        SetFileCompletionNotificationModes, FILE_FLAG_OVERLAPPED,
-        FILE_SKIP_COMPLETION_PORT_ON_SUCCESS, FILE_SKIP_SET_EVENT_ON_HANDLE,
+    use winapi::{
+        shared::{minwindef::DWORD, winerror::ERROR_IO_PENDING},
+        um::{
+            errhandlingapi::GetLastError,
+            fileapi::WriteFile,
+            ioapiset::GetOverlappedResult,
+            minwinbase::OVERLAPPED,
+            winbase::{
+                SetFileCompletionNotificationModes, FILE_FLAG_OVERLAPPED,
+                FILE_SKIP_COMPLETION_PORT_ON_SUCCESS, FILE_SKIP_SET_EVENT_ON_HANDLE,
+            },
+        },
     };
 
     use super::*;
 
     #[test]
-    fn iocp_thread_signal() {
+    fn iocp_set() {
+        // This is how many threads may block on an IOCP - we'll use two threads for the test.
         let num_threads = 2;
-        let iocp = Arc::new(IOCP::new(num_threads)); // Not signaled.
 
+        // It's simpler to just use `Arc` here, but it's OK to pass references / pointers to the IOCP to other threads
+        // (it's `Send` and `Sync`) - just make sure it's only dropped once.
+        let iocp = Arc::new(IOCP::new(num_threads).unwrap()); // Not signaled.
+
+        // Create two threads which will just wait for the IOCP for a (very long) duration.
+        // They'll wake up only when we signal the IOCP explicitly, as we won't perform any IO here.
         let iocp_1 = iocp.clone();
         let t_1 = thread::spawn(move || {
             let now = Instant::now();
-            let res = iocp_1.wait(Duration::from_secs(1_000_000));
+            let res = iocp_1.wait(Duration::from_secs(1_000_000)).unwrap();
             let elapsed = now.elapsed();
             (res, elapsed)
         });
@@ -293,7 +362,7 @@ mod tests {
         let iocp_2 = iocp.clone();
         let t_2 = thread::spawn(move || {
             let now = Instant::now();
-            let res = iocp_2.wait(Duration::from_secs(1_000_000));
+            let res = iocp_2.wait(Duration::from_secs(1_000_000)).unwrap();
             let elapsed = now.elapsed();
             (res, elapsed)
         });
@@ -301,53 +370,96 @@ mod tests {
         // Wait for a second.
         thread::sleep(Duration::from_secs(1));
 
+        // Signal one (random) thread.
         iocp.set();
 
         // One of the threads has exited, the other is still waiting.
 
+        // Wait for another second.
         thread::sleep(Duration::from_millis(1_000));
 
         iocp.set();
 
-        // Now both have exited.
+        // Now both must have exited.
 
-        let res_1 = t_1.join().unwrap();
+        let (res_1, elapsed_1) = t_1.join().unwrap();
 
-        assert!(discriminant(&res_1.0) == discriminant(&IOCPResult::Signaled));
-        assert!(res_1.1.as_millis() >= 500);
+        assert!(matches!(res_1, IOCPResult::Signaled));
+        assert!(elapsed_1.as_millis() >= 500); // We waited for at least a second before a thread got signaled and exited.
 
-        let res_2 = t_2.join().unwrap();
+        let (res_2, elapsed_2) = t_2.join().unwrap();
 
-        assert!(discriminant(&res_2.0) == discriminant(&IOCPResult::Signaled));
-        assert!(res_2.1.as_millis() >= 500);
+        assert!(matches!(res_2, IOCPResult::Signaled));
+        assert!(elapsed_2.as_millis() >= 500); // We waited for at least a second before a thread got signaled and exited.
 
-        if res_1.1.as_millis() > res_2.1.as_millis() {
-            assert!(res_1.1.as_millis() - res_2.1.as_millis() >= 500);
+        // Find out which one of the threads exited first, and which one - a second later.
+        if elapsed_1.as_millis() > elapsed_2.as_millis() {
+            assert!(elapsed_1.as_millis() - elapsed_2.as_millis() >= 500); // We waited for at least a second before the second thread got signaled and exited.
         } else {
-            assert!(res_2.1.as_millis() - res_1.1.as_millis() >= 500);
+            assert!(elapsed_2.as_millis() - elapsed_1.as_millis() >= 500); // We waited for at least a second before the second thread got signaled and exited.
         }
 
-        // Not signaled.
+        // The IOCP is now not signaled again - we must time out if we block on it.
 
-        let res = iocp.wait(Duration::from_millis(1));
-        assert!(discriminant(&res) == discriminant(&IOCPResult::Timeout));
+        let res = iocp.wait(Duration::from_millis(1)).unwrap();
+        assert!(matches!(res, IOCPResult::Timeout));
     }
 
     #[test]
-    fn file_write() {
+    fn IOCPError_InvalidIOHandle() {
+        let iocp = Arc::new(IOCP::new(1).unwrap()); // Not signaled.
+
+        assert!(matches!(
+            iocp.associate_handle(0 as _).err().unwrap(),
+            IOCPError::InvalidIOHandle
+        ));
+        assert!(matches!(
+            iocp.associate_handle_key(0 as _, 0).err().unwrap(),
+            IOCPError::InvalidIOHandle
+        ));
+    }
+
+    #[test]
+    fn IOCPError_FailedToAssociate() {
+        let iocp = Arc::new(IOCP::new(1).unwrap()); // Not signaled.
+
+        let file_name = "test.txt";
+
+        // The file is not open for async IO.
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(file_name)
+            .unwrap();
+
+        assert!(matches!(
+            iocp.associate_handle(file.as_raw_handle()).err().unwrap(),
+            IOCPError::FailedToAssociate(_)
+        ));
+        assert!(matches!(
+            iocp.associate_handle_key(file.as_raw_handle(), 0)
+                .err()
+                .unwrap(),
+            IOCPError::FailedToAssociate(_)
+        ));
+
+        fs::remove_file(file_name).unwrap();
+    }
+
+    #[test]
+    fn async_write() {
         // Opens the file for async IO.
-        // Uses `std::fs::OpenOptions` Windows extension.
+        // Uses `std::fs::OpenOptions` Windows-specific extension.
         fn open_async_file<P: AsRef<Path>>(path: P) -> fs::File {
             let file = fs::OpenOptions::new()
                 .create(true)
                 .append(true)
-                .custom_flags(FILE_FLAG_OVERLAPPED)
+                .custom_flags(FILE_FLAG_OVERLAPPED) // <- this is the async IO flag
                 .open(path)
                 .unwrap();
 
-            // Do not notify the IOCP if the operation actually completed synchronously
-            // (e.g., the file was opened for sync IO).
-            // Also do not set the file handle / explicit event in `OVERLAPPED` on completion.
+            // Important - we do not want to notify the IOCP if the operation actually completed synchronously.
+            // Also do not signal the file handle on completion.
             let result = unsafe {
                 SetFileCompletionNotificationModes(
                     file.as_raw_handle(),
@@ -358,41 +470,60 @@ mod tests {
 
             file
         }
-
-        enum WriteToAsyncFileResult {
+        enum WriteFileAsyncResult {
+            /// Write completed synchronously.
+            /// Contains the number of bytes written.
             Sync(usize),
+            /// Write completed asynchronously.
+            /// IOCP will be notified of actual write completion later.
             Async,
         }
 
-        fn write_to_async_file(
+        /// Tries to write the data in `buf` to the file `handle`.
+        /// NOTE - `handle` must be opened for async IO.
+        fn write_file_async(
             handle: HANDLE,
-            overlapped: *mut OVERLAPPED,
+            overlapped: NonNull<OVERLAPPED>,
             buf: &[u8],
-        ) -> io::Result<WriteToAsyncFileResult> {
-            let len = cmp::min(buf.len(), <DWORD>::max_value() as usize) as DWORD;
+        ) -> io::Result<WriteFileAsyncResult> {
+            let len = cmp::min(buf.len(), DWORD::MAX as usize) as DWORD;
 
             let mut written: DWORD = 0;
 
-            let result =
-                unsafe { WriteFile(handle, buf.as_ptr() as _, len, &mut written, overlapped) };
+            let result = unsafe {
+                WriteFile(
+                    handle,
+                    buf.as_ptr() as _,
+                    len,
+                    &mut written,
+                    overlapped.as_ptr(),
+                )
+            };
 
             // The write completed synchronously.
             if result != 0 {
-                return Ok(WriteToAsyncFileResult::Sync(written as usize));
+                return Ok(WriteFileAsyncResult::Sync(written as usize));
+
+            // Else the write either completed synchronously or there was an error.
             } else {
                 let error = unsafe { GetLastError() };
 
                 // Completed asynchronously.
                 if error == ERROR_IO_PENDING {
-                    return Ok(WriteToAsyncFileResult::Async);
+                    return Ok(WriteFileAsyncResult::Async);
 
                 // Some actual error.
                 } else {
-                    return Err(io::Error::from_raw_os_error(error as i32));
+                    return Err(io::Error::from_raw_os_error(error as _));
                 }
             }
         }
 
+        /// `num_pending` will be decremented by the calling thread here if the file write completes synchronously,
+        /// but is not used if the file write is initiated asyncronously.
+        /// `completion_flag` will be set by the main thread when the file write which was initiated asyncronously
+        /// completes (as signaled by the IOCP).
+        /// I.e., `completion_flag` will not be used at all if the file write was completed synchronously.
         fn do_the_thing<P: AsRef<Path>>(
             iocp: &IOCP,
             path: P,
@@ -401,24 +532,40 @@ mod tests {
             num_pending: &AtomicUsize,
             completion_flag: &AtomicBool,
         ) {
+            // Open the file for async IO and associate it with the IOCP.
             let file = open_async_file(path);
+            iocp.associate_handle_key(file.as_raw_handle(), key)
+                .unwrap();
 
-            iocp.associate_handle_key(file.as_raw_handle(), key);
-
+            // Issue the write, passing the pointer to the `OVERLAPPED` struct on the stack.
+            // NOTE - the `OVERLAPPED` struct must not go out of scope until the write actually completes.
             let mut overlapped: OVERLAPPED = unsafe { mem::zeroed() };
-            let res = write_to_async_file(file.as_raw_handle(), &mut overlapped, buf);
+            let res = write_file_async(
+                file.as_raw_handle(),
+                unsafe { NonNull::new_unchecked(&mut overlapped) },
+                buf,
+            )
+            .unwrap();
 
             match res {
-                Ok(WriteToAsyncFileResult::Sync(bytes_transferred)) => {
+                // The write completed synchronously.
+                WriteFileAsyncResult::Sync(bytes_transferred) => {
                     assert_eq!(bytes_transferred, buf.len());
+                    // Decrement the pending counter for the main thread.
                     num_pending.fetch_sub(1, Ordering::SeqCst);
                 }
-                Ok(WriteToAsyncFileResult::Async) => {
-                    // Or we could use an event in the `OVERLAPPED`, but I'm too lazy.
+                // The write completed asynchronously.
+                WriteFileAsyncResult::Async => {
+                    // Wait for actual IO completion as signaled by the IOCP in the main thread.
+                    // We could use an event in the `OVERLAPPED` struct, or some other waitable event, but I'm too lazy.
                     while !completion_flag.load(Ordering::SeqCst) {
                         thread::yield_now();
                     }
+                    // IOCP was notified of IO completion with this thread's key, and the main thread set the `completion_flag`
+                    // for the correct thread.
 
+                    // Get the number of bytes transferred using the same `OVERLAPPED` pointer we passed to `WriteFile` -
+                    // this is why the `OVERLAPPED` struct must live until this point.
                     let mut bytes_transferred: DWORD = 0;
 
                     let result = unsafe {
@@ -426,31 +573,44 @@ mod tests {
                             file.as_raw_handle(),
                             &mut overlapped,
                             &mut bytes_transferred,
-                            false as _,
+                            false as _, // <- we don't need to wait on an `OVERLAPPED` event / file handle as we know the operation has completed via IOCP.
                         )
                     };
 
                     assert!(result > 0);
                     assert_eq!(bytes_transferred as usize, buf.len());
+
+                    // Main thread has already handled the pending counter.
                 }
-                Err(_) => panic!("Write to async file failed."),
             }
         }
 
+        // We'll use one thread (the main thread) in this test to wait on the IOCP.
         let num_threads = 1;
-        let iocp = Arc::new(IOCP::new(num_threads)); // Not signaled.
 
-        let num_pending = Arc::new(AtomicUsize::new(2));
+        // It's simpler to just use `Arc` here, but it's OK to pass references / pointers to the IOCP to other threads
+        // (it's `Send` and `Sync`) - just make sure it's only dropped once.
+        let iocp = Arc::new(IOCP::new(num_threads).unwrap());
+
+        // We'll issue 2 file writes.
+        let num_pending = 2;
+        let num_pending = Arc::new(AtomicUsize::new(num_pending));
 
         let file_name = "test.txt";
 
+        // We'll spawn two threads to actually open the file and perform the writes.
+
+        // Thread 1 will write this data with this key.
         let thread_1_key = 1;
         let thread_1_data = b"1111";
         let thread_1_flag = Arc::new(AtomicBool::new(false));
 
+        // Thread 2 will write this data with this key.
         let thread_2_key = 2;
         let thread_2_data = b"22222222";
         let thread_2_flag = Arc::new(AtomicBool::new(false));
+
+        // Sapwn the threads.
 
         let iocp_1 = iocp.clone();
         let num_pending_1 = num_pending.clone();
@@ -480,22 +640,35 @@ mod tests {
             );
         });
 
+        // The main thread will wait for all write operations to either
+        // 1) complete synchronously (worker threads will then decrement `num_pending` and exit), or
+        // 2) complete asynchronously (then we'll "wake" the correct thread via its `completion_flag`)
+        // and handle the `num_pending` counter ourselves.
         while num_pending.load(Ordering::SeqCst) > 0 {
-            let result = iocp.wait_infinite();
+            // Blocking wait on the IOCP.
+            let result = iocp.wait_infinite().unwrap();
+            // The IOCP has woken us up.
 
             match result {
+                // IO completion is the only expected outcome.
                 IOCPResult::IOComplete(ioresult) => {
+                    // The `key` in the async IO result allows us to figure out which thread's file write
+                    // has completed.
                     match ioresult.key {
                         // Thread 1 async IO completed.
                         1 => {
                             assert_eq!(ioresult.bytes_transferred, thread_1_data.len());
                             num_pending.fetch_sub(1, Ordering::SeqCst);
+
+                            // "Wake" the thread and let it exit.
                             thread_1_flag.store(true, Ordering::SeqCst);
                         }
                         // Thread 2 async IO completed.
                         2 => {
                             assert_eq!(ioresult.bytes_transferred, thread_2_data.len());
                             num_pending.fetch_sub(1, Ordering::SeqCst);
+
+                            // "Wake" the thread and let it exit.
                             thread_2_flag.store(true, Ordering::SeqCst);
                         }
                         _ => {
@@ -504,10 +677,12 @@ mod tests {
                     }
                 }
                 _ => {
-                    unreachable!();
+                    panic!("expected IO completion");
                 }
             }
         }
+
+        // All file writes have completed, both worker threads are free to exit - wait for them to do so.
 
         t_2.join().unwrap();
         t_1.join().unwrap();
@@ -519,8 +694,9 @@ mod tests {
         let metadata = read_file.metadata().unwrap();
         let len = metadata.len();
 
-        assert_eq!(len, (thread_1_data.len() + thread_2_data.len()) as u64);
+        assert_eq!(len, (thread_1_data.len() + thread_2_data.len()) as _);
 
+        // Clean up the temporary file.
         fs::remove_file(file_name).unwrap();
     }
 }
