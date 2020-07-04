@@ -504,7 +504,7 @@ mod tests {
             if result != 0 {
                 return Ok(WriteFileAsyncResult::Sync(written as usize));
 
-            // Else the write either completed synchronously or there was an error.
+            // Else the write either completed asynchronously or there was an error.
             } else {
                 let error = unsafe { GetLastError() };
 
@@ -600,17 +600,17 @@ mod tests {
 
         // We'll spawn two threads to actually open the file and perform the writes.
 
-        // Thread 1 will write this data with this key.
+        // Thread 1 will write these data with this key.
         let thread_1_key = 1;
         let thread_1_data = b"1111";
         let thread_1_flag = Arc::new(AtomicBool::new(false));
 
-        // Thread 2 will write this data with this key.
+        // Thread 2 will write these data with this key.
         let thread_2_key = 2;
         let thread_2_data = b"22222222";
         let thread_2_flag = Arc::new(AtomicBool::new(false));
 
-        // Sapwn the threads.
+        // Spawn the threads.
 
         let iocp_1 = iocp.clone();
         let num_pending_1 = num_pending.clone();
